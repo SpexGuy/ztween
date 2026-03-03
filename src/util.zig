@@ -143,7 +143,7 @@ pub inline fn len(indexable: anytype) usize {
 // This is no longer supported :(
 //@field(@as(PtrType, @ptrCast(@alignCast(inner_ptr.?))), @tagName(functionName))();
 // So we need this worse implementation
-pub inline fn callMember(lhs: anytype, memberFunc: EnumLiteral, params: anytype) void {
+pub inline fn callMember(lhs: anytype, memberFunc: EnumLiteral, params: anytype, comptime ReturnType: type) ReturnType {
     const LhsType = @TypeOf(lhs);
     const lhs_ti = @typeInfo(LhsType);
     const ObjectType = if (lhs_ti == .pointer) lhs_ti.pointer.child else LhsType;
@@ -153,14 +153,14 @@ pub inline fn callMember(lhs: anytype, memberFunc: EnumLiteral, params: anytype)
     if (self_param.type) |SelfParam| {
         const self_param_info = @typeInfo(SelfParam);
         if ((self_param_info == .pointer) == (lhs_ti == .pointer)) {
-            @call(.auto, function, .{lhs} ++ params);
+            return @call(.auto, function, .{lhs} ++ params);
         } else if (self_param_info == .pointer) {
-            @call(.auto, function, .{&lhs} ++ params);
+            return @call(.auto, function, .{&lhs} ++ params);
         } else {
-            @call(.auto, function, .{lhs.*} ++ params);
+            return @call(.auto, function, .{lhs.*} ++ params);
         }
     } else {
-        @call(.auto, function, .{lhs} ++ params);
+        return @call(.auto, function, .{lhs} ++ params);
     }
 }
 
@@ -201,69 +201,87 @@ pub fn erasePtr(ptr: anytype) ?*anyopaque {
 
 // };
 
-pub const Callback = struct {
-    object: ?*anyopaque,
-    callback: ?*const fn (?*anyopaque) void,
-
-    pub const none: Callback = .{ .object = undefined, .callback = null };
-
-    pub fn bindNoParams(comptime function: fn () void) Callback {
-        const Wrap = struct {
-            fn callbackBindNoArgs(ptr: ?*anyopaque) void {
-                _ = ptr;
-                function();
-            }
-        };
-        return .{ .object = undefined, .callback = Wrap.callbackBindNoArgs };
+pub fn BoundFn(InFnType: type) type {
+    {
+        const ti = @typeInfo(InFnType);
+        if (ti != .@"fn") @compileError("BoundFn requires a function type to bind");
+        if (ti.@"fn".is_generic or ti.@"fn".return_type == null) @compileError("Cannot bind a runtime pointer for a generic function");
+        if (ti.@"fn".is_var_args) @compileError("Cannot bind a varargs function");
     }
+    return struct {
+        pub const FnType = InFnType;
+        pub const ArgPack = std.meta.ArgsTuple(FnType);
+        pub const ReturnType = @typeInfo(FnType).@"fn".return_type.?;
 
-    pub fn bind(comptime function: anytype, raw_ptr: anytype) Callback {
-        const ParamType = @TypeOf(raw_ptr);
-        const Wrap = struct {
-            fn callbackBindWrapper(ptr: ?*anyopaque) void {
-                if (ParamType == @TypeOf(null)) {
-                    function(null);
-                } else if (ParamType == @TypeOf(undefined)) {
-                    function(undefined);
-                } else {
-                    function(@as(ParamType, @ptrCast(@alignCast(ptr))));
+        object: ?*anyopaque,
+        callback: ?*const fn (?*anyopaque, ArgPack) ReturnType,
+
+        pub const none: @This() = .{ .object = undefined, .callback = null };
+
+        pub fn bindStatic(comptime function: FnType) @This() {
+            const Wrap = struct {
+                fn callbackBindNoArgs(ptr: ?*anyopaque, args: ArgPack) ReturnType {
+                    _ = ptr;
+                    return @call(.auto, function, args);
                 }
-            }
-        };
-        return .{ .object = erasePtr(raw_ptr), .callback = Wrap.callbackBindWrapper };
-    }
-
-    pub fn bindMember(objPtr: anytype, functionName: EnumLiteral) Callback {
-        const ptr = if (@typeInfo(@TypeOf(objPtr)) == .optional or @TypeOf(objPtr) == @TypeOf(null)) blk: {
-            if (objPtr == null) {
-                return none;
-            }
-            break :blk objPtr.?;
-        } else objPtr;
-        const PtrType = @TypeOf(ptr);
-        const pti = @typeInfo(PtrType);
-        if (pti != .pointer or pti.pointer.size != .one) {
-            @compileError("Cannot bind member function for non-pointer type " ++ @typeName(PtrType));
-        }
-        if (!@hasDecl(pti.pointer.child, @tagName(functionName))) {
-            @compileError("Type " ++ @typeName(pti.pointer.child) ++ " has no member function " ++ @tagName(functionName));
+            };
+            return .{ .object = undefined, .callback = Wrap.callbackBindNoArgs };
         }
 
-        const Wrap = struct {
-            fn callbackMemberWrapper(inner_ptr: ?*anyopaque) void {
-                callMember(@as(PtrType, @ptrCast(@alignCast(inner_ptr.?))), functionName, .{});
-            }
-        };
-
-        return .{ .object = erasePtr(ptr), .callback = Wrap.callbackMemberWrapper };
-    }
-
-    pub fn call(cb: Callback) void {
-        if (cb.callback) |func| {
-            func(cb.object);
+        pub fn bind(comptime function: anytype, raw_ptr: anytype) @This() {
+            const ParamType = @TypeOf(raw_ptr);
+            const Wrap = struct {
+                fn callbackBindWrapper(ptr: ?*anyopaque, args: ArgPack) ReturnType {
+                    if (ParamType == @TypeOf(null)) {
+                        return @call(.auto, function, .{null} ++ args);
+                    } else if (ParamType == @TypeOf(undefined)) {
+                        return @call(.auto, function, .{undefined} ++ args);
+                    } else {
+                        return @call(.auto, function, .{@as(ParamType, @ptrCast(@alignCast(ptr)))} ++ args);
+                    }
+                }
+            };
+            return .{ .object = erasePtr(raw_ptr), .callback = Wrap.callbackBindWrapper };
         }
-    }
-};
+
+        pub fn bindMember(objPtr: anytype, functionName: EnumLiteral) @This() {
+            const ptr = if (@typeInfo(@TypeOf(objPtr)) == .optional or @TypeOf(objPtr) == @TypeOf(null)) blk: {
+                if (objPtr == null) {
+                    return none;
+                }
+                break :blk objPtr.?;
+            } else objPtr;
+            const PtrType = @TypeOf(ptr);
+            const pti = @typeInfo(PtrType);
+            if (pti != .pointer or pti.pointer.size != .one) {
+                @compileError("Cannot bind member function for non-pointer type " ++ @typeName(PtrType));
+            }
+            if (!@hasDecl(pti.pointer.child, @tagName(functionName))) {
+                @compileError("Type " ++ @typeName(pti.pointer.child) ++ " has no member function " ++ @tagName(functionName));
+            }
+
+            const Wrap = struct {
+                fn callbackMemberWrapper(inner_ptr: ?*anyopaque, args: ArgPack) ReturnType {
+                    return callMember(@as(PtrType, @ptrCast(@alignCast(inner_ptr.?))), functionName, args, ReturnType);
+                }
+            };
+
+            return .{ .object = erasePtr(ptr), .callback = Wrap.callbackMemberWrapper };
+        }
+
+        pub fn isBound(cb: @This()) bool {
+            return cb.callback != null;
+        }
+
+        pub inline fn call(cb: @This(), args: std.meta.ArgsTuple(FnType)) ?ReturnType {
+            if (cb.callback) |func| {
+                return @as(ReturnType, func(cb.object, args));
+            } else {
+                return null;
+            }
+        }
+    };
+}
 
 test "Callback" {
     const TestObj = struct {
@@ -272,68 +290,77 @@ test "Callback" {
 
         count: u32 = 0,
 
-        fn increment(self: *TestObj) void {
-            self.count +%= 1;
+        fn increment(self: *TestObj, amt: u32) usize {
+            self.count +%= amt;
+            return self.count;
         }
-        fn decrement(self: *TestObj) void {
-            self.count -%= 1;
+        fn decrement(self: *TestObj, amt: u32) usize {
+            self.count -%= amt;
+            return self.count;
         }
 
-        fn optional_increment(o: ?*TestObj) void {
+        fn optional_increment(o: ?*TestObj, amt: u32) usize {
             if (o) |to| {
-                to.increment();
+                return to.increment(amt);
             } else {
-                static_increment();
+                return static_increment(amt);
             }
         }
 
-        fn static_increment() void {
-            global_count += 1;
+        fn static_increment(amt: u32) usize {
+            global_count += amt;
+            return global_count;
         }
     };
 
     TestObj.global_count = 0;
     var to: TestObj = .{};
 
+    const Callback = BoundFn(fn (u32) usize);
+
     const cb_incr: Callback = .bindMember(&to, .increment);
     const cb_decr: Callback = .bindMember(@as(?*TestObj, &to), .decrement);
     const cb_null: Callback = .bindMember(@as(?*TestObj, null), .decrement);
     const cb_null_2: Callback = .none;
-    const cb_static_incr: Callback = .bindNoParams(TestObj.static_increment);
+    const cb_static_incr: Callback = .bindStatic(TestObj.static_increment);
     const cb_opt_static: Callback = .bind(TestObj.optional_increment, @as(?*TestObj, null));
     const cb_opt_to: Callback = .bind(TestObj.optional_increment, @as(?*TestObj, &to));
     const cb_opt_static_2: Callback = .bind(TestObj.optional_increment, null);
     const cb_opt_to_2: Callback = .bind(TestObj.optional_increment, &to);
 
+    var rv: ?usize = null;
     try std.testing.expectEqual(@as(u32, 0), to.count);
     try std.testing.expectEqual(@as(u32, 0), TestObj.global_count);
-    cb_incr.call();
+    rv = cb_incr.call(.{1});
+    try std.testing.expectEqual(@as(?usize, 1), rv);
     try std.testing.expectEqual(@as(u32, 1), to.count);
-    cb_incr.call();
+    rv = cb_incr.call(.{1});
+    try std.testing.expectEqual(@as(?usize, 2), rv);
     try std.testing.expectEqual(@as(u32, 2), to.count);
     try std.testing.expectEqual(@as(u32, 0), TestObj.global_count);
-    cb_decr.call();
+    rv = cb_decr.call(.{1});
     try std.testing.expectEqual(@as(u32, 1), to.count);
     try std.testing.expectEqual(@as(u32, 0), TestObj.global_count);
-    cb_null.call();
+    rv = cb_null.call(.{1});
     try std.testing.expectEqual(@as(u32, 1), to.count);
     try std.testing.expectEqual(@as(u32, 0), TestObj.global_count);
-    cb_null_2.call();
+    rv = cb_null_2.call(.{1});
     try std.testing.expectEqual(@as(u32, 1), to.count);
     try std.testing.expectEqual(@as(u32, 0), TestObj.global_count);
-    cb_static_incr.call();
+    rv = cb_static_incr.call(.{1});
     try std.testing.expectEqual(@as(u32, 1), to.count);
     try std.testing.expectEqual(@as(u32, 1), TestObj.global_count);
-    cb_opt_static.call();
+    rv = cb_opt_static.call(.{1});
     try std.testing.expectEqual(@as(u32, 1), to.count);
     try std.testing.expectEqual(@as(u32, 2), TestObj.global_count);
-    cb_opt_to.call();
+    rv = cb_opt_to.call(.{1});
     try std.testing.expectEqual(@as(u32, 2), to.count);
     try std.testing.expectEqual(@as(u32, 2), TestObj.global_count);
-    cb_opt_static_2.call();
+    rv = cb_opt_static_2.call(.{1});
+    try std.testing.expectEqual(@as(?usize, 3), rv);
     try std.testing.expectEqual(@as(u32, 2), to.count);
     try std.testing.expectEqual(@as(u32, 3), TestObj.global_count);
-    cb_opt_to_2.call();
+    rv = cb_opt_to_2.call(.{1});
     try std.testing.expectEqual(@as(u32, 3), to.count);
     try std.testing.expectEqual(@as(u32, 3), TestObj.global_count);
 }

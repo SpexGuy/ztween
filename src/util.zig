@@ -143,7 +143,7 @@ pub inline fn len(indexable: anytype) usize {
 // This is no longer supported :(
 //@field(@as(PtrType, @ptrCast(@alignCast(inner_ptr.?))), @tagName(functionName))();
 // So we need this worse implementation
-pub inline fn callMember(lhs: anytype, memberFunc: EnumLiteral, params: anytype, comptime ReturnType: type) ReturnType {
+pub inline fn callMember(lhs: anytype, memberFunc: EnumLiteral, params: anytype, ReturnType: type) ReturnType {
     const LhsType = @TypeOf(lhs);
     const lhs_ti = @typeInfo(LhsType);
     const ObjectType = if (lhs_ti == .pointer) lhs_ti.pointer.child else LhsType;
@@ -164,43 +164,117 @@ pub inline fn callMember(lhs: anytype, memberFunc: EnumLiteral, params: anytype,
     }
 }
 
-// Oof
-pub fn erasePtr(ptr: anytype) ?*anyopaque {
-    if (@TypeOf(ptr) == @TypeOf(null)) {
-        return null;
-    } else if (@TypeOf(ptr) == @TypeOf(undefined)) {
-        return undefined;
-    } else {
-        return @ptrCast(@constCast(ptr));
+const ErasedObj = extern union {
+    ptr: ?*anyopaque,
+    bits: usize,
+
+    const ErasureStrategy = enum {
+        cannot_erase,
+        bitcast,
+        unwrap_pointer,
+    };
+
+    pub fn erase(ParamType: type, param: ParamType) ErasedObj {
+        if (ParamType == @TypeOf(null) or ParamType == @TypeOf(undefined)) {
+            return undefined;
+        }
+        return switch (comptime findErasureStrategy(ParamType)) {
+            .cannot_erase => @compileError("Type " ++ @typeName(ParamType) ++ " is too large to be erased."),
+            .bitcast => b: {
+                var packed_val: usize = 0;
+                std.mem.asBytes(&packed_val)[0..@sizeOf(ParamType)].* = std.mem.asBytes(&param).*;
+                break :b .{ .bits = packed_val };
+            },
+            .unwrap_pointer => .{ .ptr = unwrapWrappedPtr(param) },
+        };
     }
+
+    pub inline fn unerase(obj: ErasedObj, ParamType: type) ParamType {
+        return switch (comptime findErasureStrategy(ParamType)) {
+            .cannot_erase => @compileError("Type " ++ @typeName(ParamType) ++ " is too large to be erased."),
+            .bitcast => b: {
+                var result: ParamType = undefined;
+                std.mem.asBytes(&result).* = std.mem.asBytes(&obj.bits)[0..@sizeOf(ParamType)].*;
+                break :b result;
+            },
+            .unwrap_pointer => wrapWrappedPtr(ParamType, obj.ptr),
+        };
+    }
+
+    inline fn findErasureStrategy(T: type) ErasureStrategy {
+        if (comptime isWrappedPtrOrOptPtr(T)) {
+            return .unwrap_pointer;
+        } else if (@sizeOf(T) <= @sizeOf(usize)) {
+            return .bitcast;
+        } else {
+            return .cannot_erase;
+        }
+    }
+
+    fn isWrappedPtrOrOptPtr(T: type) bool {
+        if (comptime isPtrOrOptPtr(T)) return true;
+        if (getSingleField(T)) |field| {
+            return isWrappedPtrOrOptPtr(field.type);
+        }
+        return false;
+    }
+
+    fn unwrapWrappedPtr(wrapped: anytype) ?*anyopaque {
+        const Wrapper = @TypeOf(wrapped);
+        if (comptime isPtrOrOptPtr(Wrapper)) {
+            return @ptrCast(@constCast(wrapped));
+        } else if (comptime getSingleField(Wrapper)) |field| {
+            return unwrapWrappedPtr(@field(wrapped, field.name));
+        } else {
+            @compileError("unwrapWrappedPtr cannot unwrap type " ++ @typeName(Wrapper));
+        }
+    }
+
+    fn wrapWrappedPtr(comptime Wrapper: type, ptr: ?*anyopaque) Wrapper {
+        if (comptime isPtrOrOptPtr(Wrapper)) {
+            return @ptrCast(@alignCast(ptr));
+        } else if (comptime getSingleField(Wrapper)) |field| {
+            var result: Wrapper = undefined;
+            @field(result, field.name) = wrapWrappedPtr(field.type, ptr);
+            return result;
+        } else {
+            @compileError("wrapWrappedPtr cannot wrap type " ++ @typeName(Wrapper));
+        }
+    }
+
+    fn isPtrOrOptPtr(comptime T: type) bool {
+        const ti = @typeInfo(T);
+        return isPtr(ti) or (ti == .optional and isPtr(@typeInfo(ti.optional.child)));
+    }
+
+    fn isPtr(comptime ti: std.builtin.Type) bool {
+        return ti == .pointer and ti.pointer.size != .slice;
+    }
+
+    /// If a struct has only one non-comptime field, returns that field.
+    /// Otherwise returns null.
+    fn getSingleField(comptime T: type) ?std.builtin.Type.StructField {
+        switch (@typeInfo(T)) {
+            .@"struct" => |str| {
+                var field: ?std.builtin.Type.StructField = null;
+                for (str.fields) |f| {
+                    if (f.is_comptime) continue;
+                    if (field != null) return null; // two fields found
+                    field = f;
+                }
+                return field;
+            },
+            else => {},
+        }
+        return null;
+    }
+};
+
+pub inline fn isComptimeKnown(param: anytype) bool {
+    return @typeInfo(@TypeOf(.{param})).@"struct".fields[0].is_comptime;
 }
 
-// // Oof
-// const ErasedPointer = struct {
-//     erased: ?*anyopaque,
-
-//     pub fn init(ptr: anytype) ErasedPointer {
-//         if (@TypeOf(ptr) == @TypeOf(null)) {
-//             return .{ .erased = null };
-//         } else if (@TypeOf(ptr) == @TypeOf(undefined)) {
-//             return .{ .erased = undefined };
-//         } else {
-//             return .{ .erased = @constCast(@ptrCast(ptr)) };
-//         }
-//     }
-
-//     pub fn get(ptr: ErasedPointer, comptime PtrType: type) PtrType {
-//         if (PtrType == @TypeOf(null)) {
-//             return null;
-//         } else if (PtrType == @TypeOf(undefined)) {
-//             return undefined;
-//         } else {
-//             return @ptrCast(@alignCast(ptr.erased));
-//         }
-//     }
-
-// };
-
+///
 pub fn BoundFn(InFnType: type) type {
     {
         const ti = @typeInfo(InFnType);
@@ -213,93 +287,116 @@ pub fn BoundFn(InFnType: type) type {
         pub const ArgPack = std.meta.ArgsTuple(FnType);
         pub const ReturnType = @typeInfo(FnType).@"fn".return_type.?;
 
-        object: ?*anyopaque,
-        callback: ?*const fn (?*anyopaque, ArgPack) ReturnType,
+        object: ErasedObj,
+        function: ?*const fn (ErasedObj, ArgPack) ReturnType,
 
-        pub const none: @This() = .{ .object = undefined, .callback = null };
+        /// A bound function with no binding, useful for default initialization.
+        pub const none: @This() = .{ .object = undefined, .function = null };
 
+        /// Create a bound function with no extra context pointer parameter.
         pub fn bindStatic(comptime function: FnType) @This() {
             const Wrap = struct {
-                fn callbackBindNoArgs(ptr: ?*anyopaque, args: ArgPack) ReturnType {
-                    _ = ptr;
+                fn boundFnStatic(_: ErasedObj, args: ArgPack) ReturnType {
                     return @call(.auto, function, args);
                 }
             };
-            return .{ .object = undefined, .callback = Wrap.callbackBindNoArgs };
+            return .{ .object = undefined, .function = Wrap.boundFnStatic };
         }
 
-        pub fn bind(comptime function: anytype, raw_ptr: anytype) @This() {
-            const ParamType = @TypeOf(raw_ptr);
-            const Wrap = struct {
-                fn callbackBindWrapper(ptr: ?*anyopaque, args: ArgPack) ReturnType {
-                    if (ParamType == @TypeOf(null)) {
-                        return @call(.auto, function, .{null} ++ args);
-                    } else if (ParamType == @TypeOf(undefined)) {
-                        return @call(.auto, function, .{undefined} ++ args);
-                    } else {
-                        return @call(.auto, function, .{@as(ParamType, @ptrCast(@alignCast(ptr)))} ++ args);
+        /// Create a bound function for a function and a pointer or handle.
+        /// The parameter can be any type, as long as it is smaller than or
+        /// the same size as a pointer. It must match (or be coercible to)
+        /// the type of the first argument of the function.
+        pub fn bind(comptime function: anytype, param: anytype) @This() {
+            // This isn't an inline function, but comptime-only types like `null`
+            // need special handling, as they force the `unerase` function to be
+            // comptime, which is problematic. As a bonus, this allows any parameter
+            // (even large or unsized ones) to be bound at comptime by calling `comptime .bind(...)`.
+            if (isComptimeKnown(param)) {
+                const Wrap = struct {
+                    fn boundFnComptime(_: ErasedObj, args: ArgPack) ReturnType {
+                        return @call(.auto, function, .{param} ++ args);
                     }
-                }
-            };
-            return .{ .object = erasePtr(raw_ptr), .callback = Wrap.callbackBindWrapper };
+                };
+                return .{ .object = undefined, .function = &Wrap.boundFnComptime };
+            } else {
+                const ParamType = @TypeOf(param);
+                const Wrap = struct {
+                    fn boundFnWrap(obj: ErasedObj, args: ArgPack) ReturnType {
+                        return @call(.auto, function, .{obj.unerase(ParamType)} ++ args);
+                    }
+                };
+                return .{ .object = .erase(ParamType, param), .function = &Wrap.boundFnWrap };
+            }
         }
 
-        pub fn bindMember(objPtr: anytype, functionName: EnumLiteral) @This() {
-            const ptr = if (@typeInfo(@TypeOf(objPtr)) == .optional or @TypeOf(objPtr) == @TypeOf(null)) blk: {
-                if (objPtr == null) {
-                    return none;
-                }
-                break :blk objPtr.?;
-            } else objPtr;
-            const PtrType = @TypeOf(ptr);
-            const pti = @typeInfo(PtrType);
-            if (pti != .pointer or pti.pointer.size != .one) {
-                @compileError("Cannot bind member function for non-pointer type " ++ @typeName(PtrType));
+        /// Create a bound function for a member function. This performs the
+        /// same automatic adjustments as `obj.func()` syntax, allowing the
+        /// first parameter to be passed as a pointer or a value. Note that
+        /// the parameter to this function will be copied into the BoundFn,
+        /// so it should only be passed as a value if it is a Handle type.
+        pub fn bindMember(ptrOrHandle: anytype, functionName: EnumLiteral) @This() {
+            const ParamType = @TypeOf(ptrOrHandle);
+            const pti = @typeInfo(ParamType);
+            const NamespaceType = if (pti == .pointer and pti.pointer.size == .one) pti.pointer.child else ParamType;
+            const nsti = @typeInfo(NamespaceType);
+            if (nsti != .@"struct" and nsti != .@"union" and nsti != .@"opaque") {
+                @compileError("Type " ++ @typeName(ParamType) ++ " does not have member functions to bind!");
             }
-            if (!@hasDecl(pti.pointer.child, @tagName(functionName))) {
-                @compileError("Type " ++ @typeName(pti.pointer.child) ++ " has no member function " ++ @tagName(functionName));
+            if (!@hasDecl(NamespaceType, @tagName(functionName))) {
+                @compileError("Type " ++ @typeName(NamespaceType) ++ " has no member function " ++ @tagName(functionName));
             }
-
             const Wrap = struct {
-                fn callbackMemberWrapper(inner_ptr: ?*anyopaque, args: ArgPack) ReturnType {
-                    return callMember(@as(PtrType, @ptrCast(@alignCast(inner_ptr.?))), functionName, args, ReturnType);
+                fn boundFnMember(obj: ErasedObj, args: ArgPack) ReturnType {
+                    return callMember(obj.unerase(ParamType), functionName, args, ReturnType);
                 }
             };
-
-            return .{ .object = erasePtr(ptr), .callback = Wrap.callbackMemberWrapper };
+            return .{ .object = .erase(ParamType, ptrOrHandle), .function = Wrap.boundFnMember };
         }
 
+        /// Check whether a function is bound.
         pub fn isBound(cb: @This()) bool {
-            return cb.callback != null;
+            return cb.function != null;
         }
 
+        /// Invoke the bound function. If no function is bound, returns null.
         pub inline fn call(cb: @This(), args: std.meta.ArgsTuple(FnType)) ?ReturnType {
-            if (cb.callback) |func| {
+            if (cb.function) |func| {
                 return @as(ReturnType, func(cb.object, args));
             } else {
                 return null;
             }
         }
+
+        /// Invoke the bound function, asserting that a function is bound. This
+        /// should only be called after checking isBound().
+        pub inline fn callBound(cb: @This(), args: std.meta.ArgsTuple(FnType)) ReturnType {
+            return @as(ReturnType, cb.function.?(cb.object, args));
+        }
     };
 }
 
-test "Callback" {
+test "BoundFn" {
     const TestObj = struct {
         const TestObj = @This();
         var global_count: u32 = 0;
 
         count: u32 = 0,
 
-        fn increment(self: *TestObj, amt: u32) usize {
+        pub fn increment(self: *TestObj, amt: u32) usize {
             self.count +%= amt;
             return self.count;
         }
-        fn decrement(self: *TestObj, amt: u32) usize {
+        pub fn decrement(self: *TestObj, amt: u32) usize {
             self.count -%= amt;
             return self.count;
         }
 
-        fn optional_increment(o: ?*TestObj, amt: u32) usize {
+        pub fn sumValue(self: TestObj, amt: u32) usize {
+            return self.count + amt;
+        }
+
+        pub fn optional_increment(o: ?*TestObj, amt: u32) usize {
             if (o) |to| {
                 return to.increment(amt);
             } else {
@@ -307,26 +404,87 @@ test "Callback" {
             }
         }
 
-        fn static_increment(amt: u32) usize {
+        pub fn static_increment(amt: u32) usize {
             global_count += amt;
             return global_count;
         }
     };
 
+    const Handle = struct {
+        id: u32 = 4,
+        generation: u32 = 8,
+
+        pub fn handle_set(handle: @This(), amt: u32) usize {
+            TestObj.global_count = handle.generation + amt;
+            return TestObj.global_count;
+        }
+    };
+
+    const WrapPtr = struct {
+        val: ?*TestObj = null,
+
+        pub fn incr(self: @This(), amt: u32) usize {
+            return if (self.val) |v| v.increment(amt) else TestObj.static_increment(amt);
+        }
+        pub fn incr_const(self: *const @This(), amt: u32) usize {
+            return self.incr(amt);
+        }
+    };
+
+    const EmptyStruct = struct {
+        pub fn incr(_: *const @This(), amt: u32) usize {
+            return TestObj.static_increment(amt);
+        }
+    };
+
     TestObj.global_count = 0;
     var to: TestObj = .{};
+    var handle: Handle = .{};
+    var wrap_to: WrapPtr = .{ .val = &to };
+    var empty: EmptyStruct = .{};
+
+    try std.testing.expectEqual(ErasedObj.ErasureStrategy.unwrap_pointer, ErasedObj.findErasureStrategy(WrapPtr));
 
     const Callback = BoundFn(fn (u32) usize);
 
     const cb_incr: Callback = .bindMember(&to, .increment);
-    const cb_decr: Callback = .bindMember(@as(?*TestObj, &to), .decrement);
-    const cb_null: Callback = .bindMember(@as(?*TestObj, null), .decrement);
-    const cb_null_2: Callback = .none;
+    const cb_decr: Callback = .bindMember(&to, .decrement);
+    const cb_sum: Callback = .bindMember(&to, .sumValue);
+    const cb_null: Callback = .none;
     const cb_static_incr: Callback = .bindStatic(TestObj.static_increment);
     const cb_opt_static: Callback = .bind(TestObj.optional_increment, @as(?*TestObj, null));
     const cb_opt_to: Callback = .bind(TestObj.optional_increment, @as(?*TestObj, &to));
     const cb_opt_static_2: Callback = .bind(TestObj.optional_increment, null);
     const cb_opt_to_2: Callback = .bind(TestObj.optional_increment, &to);
+    const cb_handle: Callback = .bind(Handle.handle_set, handle);
+    const cb_handle_member: Callback = .bindMember(handle, .handle_set);
+    const cb_wrap: Callback = .bind(WrapPtr.incr, wrap_to);
+    const cb_wrap_member: Callback = .bindMember(wrap_to, .incr);
+    const cb_wrap_member_const: Callback = .bindMember(wrap_to, .incr_const);
+    const cb_empty: Callback = .bind(EmptyStruct.incr, &empty);
+    const cb_empty_member: Callback = .bindMember(empty, .incr);
+    const cb_empty_member_ptr: Callback = .bindMember(&empty, .incr);
+
+    // Clear the handles to make sure they were copied
+    handle = .{ .generation = 0, .id = 0 };
+    wrap_to = .{ .val = null };
+
+    try std.testing.expect(cb_incr.isBound());
+    try std.testing.expect(cb_decr.isBound());
+    try std.testing.expect(!cb_null.isBound());
+    try std.testing.expect(cb_static_incr.isBound());
+    try std.testing.expect(cb_opt_static.isBound());
+    try std.testing.expect(cb_opt_to.isBound());
+    try std.testing.expect(cb_opt_static_2.isBound());
+    try std.testing.expect(cb_opt_to_2.isBound());
+    try std.testing.expect(cb_handle.isBound());
+    try std.testing.expect(cb_handle_member.isBound());
+    try std.testing.expect(cb_wrap.isBound());
+    try std.testing.expect(cb_wrap_member.isBound());
+    try std.testing.expect(cb_wrap_member_const.isBound());
+    try std.testing.expect(cb_empty.isBound());
+    try std.testing.expect(cb_empty_member.isBound());
+    try std.testing.expect(cb_empty_member_ptr.isBound());
 
     var rv: ?usize = null;
     try std.testing.expectEqual(@as(u32, 0), to.count);
@@ -334,6 +492,7 @@ test "Callback" {
     rv = cb_incr.call(.{1});
     try std.testing.expectEqual(@as(?usize, 1), rv);
     try std.testing.expectEqual(@as(u32, 1), to.count);
+    try std.testing.expectEqual(@as(u32, 0), TestObj.global_count);
     rv = cb_incr.call(.{1});
     try std.testing.expectEqual(@as(?usize, 2), rv);
     try std.testing.expectEqual(@as(u32, 2), to.count);
@@ -342,9 +501,11 @@ test "Callback" {
     try std.testing.expectEqual(@as(u32, 1), to.count);
     try std.testing.expectEqual(@as(u32, 0), TestObj.global_count);
     rv = cb_null.call(.{1});
+    try std.testing.expectEqual(null, rv);
     try std.testing.expectEqual(@as(u32, 1), to.count);
     try std.testing.expectEqual(@as(u32, 0), TestObj.global_count);
-    rv = cb_null_2.call(.{1});
+    rv = cb_sum.call(.{4});
+    try std.testing.expectEqual(@as(?usize, 5), rv);
     try std.testing.expectEqual(@as(u32, 1), to.count);
     try std.testing.expectEqual(@as(u32, 0), TestObj.global_count);
     rv = cb_static_incr.call(.{1});
@@ -363,6 +524,30 @@ test "Callback" {
     rv = cb_opt_to_2.call(.{1});
     try std.testing.expectEqual(@as(u32, 3), to.count);
     try std.testing.expectEqual(@as(u32, 3), TestObj.global_count);
+    rv = cb_handle.callBound(.{2});
+    try std.testing.expectEqual(@as(u32, 3), to.count);
+    try std.testing.expectEqual(@as(u32, 10), TestObj.global_count);
+    rv = cb_handle_member.callBound(.{1});
+    try std.testing.expectEqual(@as(u32, 3), to.count);
+    try std.testing.expectEqual(@as(u32, 9), TestObj.global_count);
+    rv = cb_wrap.callBound(.{1});
+    try std.testing.expectEqual(@as(u32, 4), to.count);
+    try std.testing.expectEqual(@as(u32, 9), TestObj.global_count);
+    rv = cb_wrap_member.callBound(.{1});
+    try std.testing.expectEqual(@as(u32, 5), to.count);
+    try std.testing.expectEqual(@as(u32, 9), TestObj.global_count);
+    rv = cb_wrap_member_const.callBound(.{1});
+    try std.testing.expectEqual(@as(u32, 6), to.count);
+    try std.testing.expectEqual(@as(u32, 9), TestObj.global_count);
+    rv = cb_empty.call(.{1});
+    try std.testing.expectEqual(@as(u32, 6), to.count);
+    try std.testing.expectEqual(@as(u32, 10), TestObj.global_count);
+    rv = cb_empty_member.call(.{1});
+    try std.testing.expectEqual(@as(u32, 6), to.count);
+    try std.testing.expectEqual(@as(u32, 11), TestObj.global_count);
+    rv = cb_empty_member_ptr.call(.{1});
+    try std.testing.expectEqual(@as(u32, 6), to.count);
+    try std.testing.expectEqual(@as(u32, 12), TestObj.global_count);
 }
 
 const ScalarTypeInfo = struct {

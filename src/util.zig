@@ -685,6 +685,53 @@ test "ScalarTypeInfo Struct" {
     try std.testing.expectEqual(@as(usize, 4), funky_info.num_items);
 }
 
+pub fn hasAnyFlags(comptime T: type, a: T, b: T) bool {
+    const Int = @typeInfo(T).@"struct".backing_integer.?;
+    const a_int: Int = @bitCast(a);
+    const b_int: Int = @bitCast(b);
+    return a_int & b_int != 0;
+}
+
+pub fn offsetPtr(ptr: anytype, offset: usize) *anyopaque {
+    return @ptrCast(@constCast(@as([*]const u8, @ptrCast(&ptr)) + offset));
+}
+
+pub fn fastPow(comptime T: type, base: T, power: T) T {
+    return @exp(power * @log(base));
+}
+
+pub fn extractFields(comptime slice: anytype, comptime field: EnumLiteral) []const @FieldType(std.meta.Child(@TypeOf(slice)), @tagName(field)) {
+    return comptime b: {
+        const Element = std.meta.Child(@TypeOf(slice));
+        const Field = @FieldType(Element, @tagName(field));
+        var values: []const Field = &.{};
+        for (slice) |item| {
+            values = values ++ @as([]const Field, &.{@field(item, @tagName(field))});
+        }
+        break :b values;
+    };
+}
+
+pub fn MakeEnum(literals: []const EnumLiteral) type {
+    const Tag = @Type(.{ .int = .{
+        .bits = std.math.log2_int_ceil(usize, literals.len),
+        .signedness = .unsigned,
+    } });
+    var fields: [literals.len]std.builtin.Type.EnumField = undefined;
+    for (literals, 0..) |lit, i| {
+        fields[i] = .{
+            .name = @tagName(lit),
+            .value = @as(Tag, @intCast(i)),
+        };
+    }
+    return @Type(.{ .@"enum" = .{
+        .decls = &.{},
+        .is_exhaustive = true,
+        .tag_type = Tag,
+        .fields = &fields,
+    } });
+}
+
 const TupleBuilder = struct {
     tuple: Any = .init(.{}),
 
@@ -732,6 +779,7 @@ pub fn sanitizeFieldChain(comptime field_chain: anytype) Any {
                 fields.appendTuple(sanitizeFieldChain(item).get());
             }
         },
+        else => fields.addItem(field_chain),
     }
     return fields.tuple;
 }

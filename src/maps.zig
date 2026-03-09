@@ -183,15 +183,33 @@ test "SparseSlotMap" {
     map.deinit(allocator);
 }
 
+const DenseSlotMapKeyConfig = struct {
+    key_bits: comptime_int = 32,
+    // Set uniq to `opaque{}` explicitly to force the generated
+    // Key and Value types to be unique for your call site
+    uniq: type = opaque {},
+    // Maybe someday xD
+    // generation_bits: comptime_int = 0,
+};
+
 /// The DenseSlotMap is a list-like container with the following properties:
 ///  - Each value is assiged a stable "key" which can always be used to reference it.
 ///  - Values are stored in a dense array which can be iterated quickly
 ///  - The corresponding keys can also be iterated in parallel
-pub fn DenseSlotMap(comptime Value: type) type {
+pub fn DenseSlotMap(comptime Value: type, key_config: DenseSlotMapKeyConfig) type {
+    const l_uniq = key_config.uniq;
+    const l_SizeInt = @Type(.{ .int = .{ .bits = key_config.key_bits, .signedness = .unsigned } });
+    const l_Key = enum(l_SizeInt) {
+        _,
+        const _uniq = l_uniq;
+    };
     return struct {
         const Map = @This();
-        pub const Key = u32;
-        const free_slot: Key = ~@as(Key, 0);
+        pub const SizeInt = l_SizeInt;
+        pub const Index = l_SizeInt;
+        pub const Key = l_Key;
+
+        const index_max = ~@as(SizeInt, 0);
 
         /// Allocated storage
         storage: std.MultiArrayList(struct {
@@ -202,40 +220,70 @@ pub fn DenseSlotMap(comptime Value: type) type {
             key: Key,
             /// Sparse mapping from keys to values. This is initialized
             /// even for unallocated keys, pointing to the key in the free list.
-            index: Key,
+            index: Index,
         }) = .{},
         /// The number of currently allocated items
-        len: Key = 0,
+        len: SizeInt = 0,
 
         /// The total number of items which can be simultaneously allocated
         /// without allocating new backing memory
-        pub fn capacity(sm: *Map) Key {
+        pub fn capacity(sm: *Map) SizeInt {
             return @intCast(sm.storage.capacity);
         }
 
         /// The number of available slots which could be allocated
-        pub fn numFree(sm: *Map) Key {
+        pub fn numFree(sm: *Map) SizeInt {
             return sm.capacity() - sm.numAllocated();
         }
 
         /// The number of slots which have been allocated to the user
-        pub fn numAllocated(sm: *Map) Key {
+        pub fn numAllocated(sm: *Map) SizeInt {
             return sm.len;
         }
 
         /// DenseSlotMap can allocate a key again immediately after it is freed,
         /// so use of this function for logic may lead to a use-after-free.
-        pub fn assertAllocated(sm: *Map, key: Key) void {
-            assert(key < sm.storage.len and sm.storage.items(.index)[key] < sm.len);
+        pub fn assertAllocatedKey(sm: *Map, key: Key) void {
+            if (std.debug.runtime_safety) {
+                const key_int = @intFromEnum(key);
+                assert(key_int < sm.storage.len);
+                const index = sm.storage.items(.index)[key_int];
+                assert(sm.storage.items(.key)[index] == key); // Internal consistency: should always be true
+                assert(index < sm.len); // Allocated items are before .len
+            }
+        }
+
+        pub fn assertAllocatedIndex(sm: *Map, index: Index) void {
+            if (std.debug.runtime_safety) {
+                assert(index < sm.len); // Allocated items are before .len
+                const key = sm.storage.items(.key)[index];
+                const key_int = @intFromEnum(key);
+                assert(key_int < sm.storage.len);
+                assert(sm.storage.items(.index)[key_int] == index); // Internal consistency: should always be true
+            }
+        }
+
+        pub fn getIndex(sm: *Map, key: Key) Index {
+            sm.assertAllocatedKey(key);
+            return sm.storage.items(.index)[@intFromEnum(key)];
         }
 
         /// Find the value associated with a Key
         pub fn get(sm: *Map, key: Key) *Value {
-            sm.assertAllocated(key);
+            sm.assertAllocatedKey(key);
             const slice = sm.storage.slice();
-            const index = slice.items(.index)[key];
-            assert(slice.items(.key)[index] == key);
+            const index = slice.items(.index)[@intFromEnum(key)];
             return &slice.items(.value)[index];
+        }
+
+        pub fn getAt(sm: *Map, index: Index) *Value {
+            sm.assertAllocatedIndex(index);
+            return &sm.storage.items(.value)[index];
+        }
+
+        pub fn getKeyAt(sm: *Map, index: Index) Key {
+            sm.assertAllocatedIndex(index);
+            return sm.storage.items(.key)[index];
         }
 
         /// Release the value associated with a Key,
@@ -243,21 +291,42 @@ pub fn DenseSlotMap(comptime Value: type) type {
         /// This invalidates any pointers or slices to
         /// existing values, including from the bulkAlloc functions.
         pub fn release(sm: *Map, key: Key) void {
-            sm.assertAllocated(key);
+            sm.assertAllocatedKey(key);
+            const key_int = @intFromEnum(key);
             const slice = sm.storage.slice();
-            const index = slice.items(.index)[key];
+            const index = slice.items(.index)[key_int];
             assert(slice.items(.key)[index] == key);
             sm.len -= 1;
             const last_idx = sm.len;
             if (index != last_idx) {
                 const moved_key = slice.items(.key)[last_idx];
                 slice.items(.key)[last_idx] = key;
-                slice.items(.index)[key] = last_idx;
+                slice.items(.index)[key_int] = last_idx;
                 slice.items(.key)[index] = moved_key;
-                slice.items(.index)[moved_key] = index;
+                slice.items(.index)[@intFromEnum(moved_key)] = index;
                 slice.items(.value)[index] = slice.items(.value)[last_idx];
             }
             slice.items(.value)[last_idx] = undefined;
+        }
+
+        /// Swap the indexes of two allocated items.
+        /// Keys remain stable. This is useful for
+        /// partitioning the allocated array into
+        /// two or more segments for more efficient
+        /// iteration.
+        pub fn swapIndexes(sm: *Map, a_idx: Index, b_idx: Index) void {
+            sm.assertAllocatedIndex(a_idx);
+            if (a_idx != b_idx) {
+                sm.assertAllocatedIndex(b_idx);
+                const slice = sm.storage.slice();
+                const a_key = slice.items(.key)[a_idx];
+                const b_key = slice.items(.key)[b_idx];
+                std.mem.swap(Value, &slice.items(.value)[a_idx], &slice.items(.value)[b_idx]);
+                slice.items(.key)[a_idx] = b_key;
+                slice.items(.key)[b_idx] = a_key;
+                slice.items(.index)[@intFromEnum(a_key)] = b_idx;
+                slice.items(.index)[@intFromEnum(b_key)] = a_idx;
+            }
         }
 
         const Alloc = struct { Key, *Value };
@@ -302,24 +371,25 @@ pub fn DenseSlotMap(comptime Value: type) type {
 
         /// Resizes the capacity so that at least `count` more values can be allocated.
         pub fn ensureAdditionalCapacity(sm: *Map, allocator: std.mem.Allocator, count: usize) !void {
-            assert(count +| @as(usize, sm.len) <= @as(usize, free_slot));
+            // Check that the new size doesn't overflow our key type
+            assert(@addWithOverflow(@as(SizeInt, @intCast(count)), @as(SizeInt, @intCast(sm.len)))[1] == 0);
             if (sm.len + count <= sm.storage.len) return;
             try sm.ensureTotalCapacity(allocator, sm.len + count);
         }
 
         /// Resizes the backing memory so that at least `count` values can be simultaneously allocated.
         pub fn ensureTotalCapacity(sm: *Map, allocator: std.mem.Allocator, count: usize) !void {
-            assert(count <= free_slot);
+            assert(count <= @as(usize, index_max));
             if (count <= sm.storage.len) return;
             try sm.storage.ensureTotalCapacity(allocator, count);
             const orig_len = sm.storage.len;
-            const new_len = @min(sm.storage.capacity, free_slot);
+            const new_len = @min(sm.storage.capacity, index_max);
             sm.storage.len = new_len;
             const slice = sm.storage.slice();
             const all_keys = slice.items(.key);
             const indices = slice.items(.index);
             for (orig_len..new_len) |i| {
-                all_keys[i] = @intCast(i);
+                all_keys[i] = @enumFromInt(@as(SizeInt, @intCast(i)));
                 indices[i] = @intCast(i);
             }
         }
@@ -357,20 +427,22 @@ pub fn DenseSlotMap(comptime Value: type) type {
     };
 }
 
-fn testDenseSlotMap(map: *DenseSlotMap(u8), key_order: [5]u32) !void {
+const TestMap = DenseSlotMap(u8, .{});
+
+fn testDenseSlotMap(map: *TestMap, key_order: [5]u32) !void {
     const allocator = std.testing.allocator;
 
     const k0, const e0 = try map.alloc(allocator);
     e0.* = 100;
-    try std.testing.expectEqual(key_order[0], k0);
+    try std.testing.expectEqual(key_order[0], @intFromEnum(k0));
     const k1, const e1 = try map.alloc(allocator);
     e1.* = 101;
-    try std.testing.expectEqual(key_order[1], k1);
+    try std.testing.expectEqual(key_order[1], @intFromEnum(k1));
     const k2, const e2 = try map.alloc(allocator);
     e2.* = 102;
-    try std.testing.expectEqual(key_order[2], k2);
+    try std.testing.expectEqual(key_order[2], @intFromEnum(k2));
 
-    try std.testing.expectEqual(key_order[3], map.len);
+    try std.testing.expectEqual(3, map.len);
 
     map.release(k1);
 
@@ -388,9 +460,9 @@ fn testDenseSlotMap(map: *DenseSlotMap(u8), key_order: [5]u32) !void {
         elem.* = @intCast(103 + i);
     }
     try std.testing.expectEqual(bulk_keys.ptr, map.keys()[2..].ptr);
-    try std.testing.expectEqual(key_order[1], bulk_keys[0]);
-    try std.testing.expectEqual(key_order[3], bulk_keys[1]);
-    try std.testing.expectEqual(key_order[4], bulk_keys[2]);
+    try std.testing.expectEqual(key_order[1], @intFromEnum(bulk_keys[0]));
+    try std.testing.expectEqual(key_order[3], @intFromEnum(bulk_keys[1]));
+    try std.testing.expectEqual(key_order[4], @intFromEnum(bulk_keys[2]));
 
     total = 0;
     for (map.values()) |item| total += item;
@@ -398,7 +470,7 @@ fn testDenseSlotMap(map: *DenseSlotMap(u8), key_order: [5]u32) !void {
 }
 
 test "DenseSlotMap" {
-    var map: DenseSlotMap(u8) = .{};
+    var map: TestMap = .{};
     try testDenseSlotMap(&map, .{ 0, 1, 2, 3, 4 });
     map.clearRetainingCapacity();
     try testDenseSlotMap(&map, .{ 0, 2, 1, 3, 4 });

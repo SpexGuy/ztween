@@ -293,8 +293,20 @@ fn SetupVulkan(allocator: std.mem.Allocator, instance_extensions: *std.ArrayList
 // All the ImGui_ImplVulkanH_XXX structures/functions are optional helpers used by the demo.
 // Your real engine/app may not use them.
 fn SetupVulkanWindow(wd: *c.ImGui_ImplVulkanH_Window, surface: c.VkSurfaceKHR, width: i32, height: i32) !void {
-    wd.Surface = surface;
+    // cimgui doesn't bind the constructor for ImGui_ImplVulkanH_Window,
+    // so this is copied and manually translated from there.
+    wd.* = .{};
+    wd.PresentMode = ~@as(c_uint, 0);
+    wd.AttachmentDesc.format = c.VK_FORMAT_UNDEFINED;
+    wd.AttachmentDesc.samples = c.VK_SAMPLE_COUNT_1_BIT;
     wd.AttachmentDesc.loadOp = c.VK_ATTACHMENT_LOAD_OP_CLEAR;
+    wd.AttachmentDesc.storeOp = c.VK_ATTACHMENT_STORE_OP_STORE;
+    wd.AttachmentDesc.stencilLoadOp = c.VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    wd.AttachmentDesc.stencilStoreOp = c.VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    wd.AttachmentDesc.initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED;
+    wd.AttachmentDesc.finalLayout = c.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    wd.Surface = surface;
 
     // Check for WSI support
     var res: c.VkBool32 = undefined;

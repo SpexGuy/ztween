@@ -887,7 +887,7 @@ pub fn TweenLibrary(in_config: Configuration) type {
                             control.repeat_counter +|= 1;
                             if (control.num_repeats == infinite or control.repeat_counter <= control.num_repeats) {
                                 if (control.repeat_delay == 0) {
-                                    if (control.num_repeats == infinite) {
+                                    if (control.num_repeats == infinite and control.duration == 0) {
                                         // TODO error handling -- infinite loop tween.
                                         control.flags.killed = true;
                                     } else {
@@ -1042,7 +1042,7 @@ pub fn TweenLibrary(in_config: Configuration) type {
                     .callback = .none,
                     .delay = 0,
                     .reverse_delay = 0,
-                    .duration = 0,
+                    .duration = @max(duration, 0),
                     .repeat_delay = 0,
                     .repeat_counter = 0,
                     .num_repeats = 0,
@@ -1072,7 +1072,7 @@ pub fn TweenLibrary(in_config: Configuration) type {
                 return to(mgr, handle, field_chain, target_val, 0);
             }
 
-            pub fn wait(mgr: TweenManager, duration: TimeFloat) TweenCallbackBuilder {
+            pub fn wait(mgr: *TweenManager, duration: TimeFloat) TweenCallbackBuilder {
                 const control_id = mgr.controls.alloc(mgr.ctx.allocator()) catch |err| switch (err) {
                     error.OutOfMemory => return .{ .mgr = mgr, .control_id = null_id, .out_of_mem = true },
                 };

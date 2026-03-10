@@ -693,7 +693,7 @@ pub fn hasAnyFlags(comptime T: type, a: T, b: T) bool {
 }
 
 pub fn offsetPtr(ptr: anytype, offset: usize) *anyopaque {
-    return @ptrCast(@constCast(@as([*]const u8, @ptrCast(&ptr)) + offset));
+    return @ptrCast(@constCast(@as([*]const u8, @ptrCast(ptr)) + offset));
 }
 
 pub fn fastPow(comptime T: type, base: T, power: T) T {
